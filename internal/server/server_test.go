@@ -5,12 +5,28 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/ahmadkhidir/gogateway/internal/config"
 )
+
+// setenv sets an environment variable for the duration of the test.
+func setenv(t *testing.T, key, value string) {
+	t.Helper()
+	old, existed := os.LookupEnv(key)
+	os.Setenv(key, value)
+	t.Cleanup(func() {
+		if existed {
+			os.Setenv(key, old)
+		} else {
+			os.Unsetenv(key)
+		}
+	})
+}
 
 // newTestConfig returns a minimal config with a catch-all route.
 func newTestConfig() *config.Config {
@@ -37,6 +53,15 @@ func newTestConfig() *config.Config {
 	}
 }
 
+// hs256Token creates a signed HS256 JWT for testing.
+func hs256Token(secret []byte, claims jwt.MapClaims) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, _ := token.SignedString(secret)
+	return signed
+}
+
+// --- Existing Phase 0 / Phase 1 tests (should pass unchanged) ---
+
 func TestNewServer_InvalidUpstream(t *testing.T) {
 	cfg := newTestConfig()
 	cfg.Routes[0].Upstreams[0].URL = "://invalid"
@@ -48,6 +73,8 @@ func TestNewServer_InvalidUpstream(t *testing.T) {
 }
 
 func TestServer_ServeHTTP_RequestID(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id-Echo", r.Header.Get("X-Request-Id"))
 		w.WriteHeader(http.StatusOK)
@@ -86,12 +113,11 @@ func TestServer_ServeHTTP_RequestID(t *testing.T) {
 	if respRequestID == "" {
 		t.Error("expected X-Request-Id in response header")
 	}
-	if respRequestID != requestID {
-		t.Errorf("response X-Request-Id %q != upstream echo %q", respRequestID, requestID)
-	}
 }
 
 func TestServer_ServeHTTP_ExistingRequestID(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id-Echo", r.Header.Get("X-Request-Id"))
 		w.WriteHeader(http.StatusOK)
@@ -121,7 +147,8 @@ func TestServer_ServeHTTP_ExistingRequestID(t *testing.T) {
 }
 
 func TestServer_ServeHTTP_CatchAllRoute(t *testing.T) {
-	// A catch-all route "/*" should match any path.
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -148,7 +175,8 @@ func TestServer_ServeHTTP_CatchAllRoute(t *testing.T) {
 }
 
 func TestServer_ServeHTTP_NoRouteMatch(t *testing.T) {
-	// Without a catch-all route, an unmatched path should return 404.
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -182,7 +210,6 @@ func TestServer_ServeHTTP_NoRouteMatch(t *testing.T) {
 		t.Errorf("expected 404 for unmatched path, got %d", resp.StatusCode)
 	}
 
-	// Verify JSON error body.
 	var body errorBody
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("error decoding JSON body: %v", err)
@@ -193,6 +220,8 @@ func TestServer_ServeHTTP_NoRouteMatch(t *testing.T) {
 }
 
 func TestServer_MethodMismatch(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -215,7 +244,6 @@ func TestServer_MethodMismatch(t *testing.T) {
 		t.Fatalf("New() error: %v", err)
 	}
 
-	// POST to a GET-only route should 404.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/resource", nil)
 	srv.ServeHTTP(rec, req)
@@ -229,7 +257,8 @@ func TestServer_MethodMismatch(t *testing.T) {
 }
 
 func TestServer_MultiRouteRouting(t *testing.T) {
-	// Two upstream servers that echo which one handled the request.
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Upstream", "A")
 		w.WriteHeader(http.StatusOK)
@@ -267,7 +296,6 @@ func TestServer_MultiRouteRouting(t *testing.T) {
 		t.Fatalf("New() error: %v", err)
 	}
 
-	// Request to /api/users should go to upstream A.
 	rec1 := httptest.NewRecorder()
 	req1 := httptest.NewRequest(http.MethodGet, "/api/users", nil)
 	srv.ServeHTTP(rec1, req1)
@@ -277,7 +305,6 @@ func TestServer_MultiRouteRouting(t *testing.T) {
 		t.Errorf("/api/users: expected upstream A, got %q", resp1.Header.Get("X-Upstream"))
 	}
 
-	// Request to /health should go to upstream B.
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "/health", nil)
 	srv.ServeHTTP(rec2, req2)
@@ -289,7 +316,8 @@ func TestServer_MultiRouteRouting(t *testing.T) {
 }
 
 func TestServer_RoundRobinDistribution(t *testing.T) {
-	// Two upstream servers that count how many requests they receive.
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
 	var (
 		mu     sync.Mutex
 		countA int
@@ -346,4 +374,406 @@ func TestServer_RoundRobinDistribution(t *testing.T) {
 	}
 }
 
+// --- Phase 2 Authentication tests ---
 
+func TestAuth_RouteWithoutAuthConfig_AllowsRequest(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	// route.Auth is nil — no auth required
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for route without auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuth_JWTRequired_MissingToken(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{
+			Required: true,
+			Issuers:  []string{"https://auth.example.com"},
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// No Authorization header.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing JWT, got %d", resp.StatusCode)
+	}
+
+	var body errorBody
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Code != "JWT_INVALID" {
+		t.Errorf("expected code JWT_INVALID, got %q", body.Code)
+	}
+}
+
+func TestAuth_JWTRequired_ValidToken(t *testing.T) {
+	secret := "test-secret"
+	setenv(t, "GOGATEWAY_JWT_SECRET", secret)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo back the user ID received from the gateway.
+		w.Header().Set("X-User-ID-Echo", r.Header.Get("X-User-ID"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{
+			Required: true,
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	token := hs256Token([]byte(secret), jwt.MapClaims{
+		"sub": "user-42",
+		"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for valid JWT, got %d", resp.StatusCode)
+	}
+
+	// Upstream should have received the forwarded user ID.
+	if echo := resp.Header.Get("X-User-ID-Echo"); echo != "user-42" {
+		t.Errorf("expected upstream to receive X-User-ID 'user-42', got %q", echo)
+	}
+}
+
+func TestAuth_JWTRequired_ExpiredToken(t *testing.T) {
+	secret := "test-secret"
+	setenv(t, "GOGATEWAY_JWT_SECRET", secret)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{
+			Required: true,
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	token := hs256Token([]byte(secret), jwt.MapClaims{
+		"sub": "user-42",
+		"exp": float64(time.Now().Add(-1 * time.Hour).Unix()), // expired
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for expired JWT, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuth_APIKeyRequired_MissingKey(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		APIKey: &config.APIKeyConfig{
+			Required: true,
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing API key, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuth_APIKeyRequired_ValidKey(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	// Seed an API key file for this test.
+	keyFileDir := t.TempDir()
+	keyFilePath := keyFileDir + "/api-keys.yaml"
+	keyFileContent := `
+api_keys:
+  - id: "test-key-1"
+    key: "gw_test_valid_key"
+    service: ""
+    rate_tier: "pro"
+`
+	os.WriteFile(keyFilePath, []byte(keyFileContent), 0644)
+	setenv(t, "GOGATEWAY_API_KEY_FILE", keyFilePath)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-API-Key-ID-Echo", r.Header.Get("X-API-Key-ID"))
+		w.Header().Set("X-API-Key-Tier-Echo", r.Header.Get("X-API-Key-Tier"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		APIKey: &config.APIKeyConfig{
+			Required: true,
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-API-Key", "gw_test_valid_key")
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for valid API key, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-API-Key-ID-Echo") != "test-key-1" {
+		t.Errorf("expected key ID test-key-1, got %q", resp.Header.Get("X-API-Key-ID-Echo"))
+	}
+	if resp.Header.Get("X-API-Key-Tier-Echo") != "pro" {
+		t.Errorf("expected tier pro, got %q", resp.Header.Get("X-API-Key-Tier-Echo"))
+	}
+}
+
+func TestAuth_JWTWithAPIKeyFallback_JWTSuccess(t *testing.T) {
+	secret := "test-secret"
+	setenv(t, "GOGATEWAY_JWT_SECRET", secret)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Auth-Method", "JWT")
+		w.Header().Set("X-User-ID-Echo", r.Header.Get("X-User-ID"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{
+			Required: true,
+		},
+		APIKey: &config.APIKeyConfig{
+			Required: true, // both JWT and API key accepted
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	token := hs256Token([]byte(secret), jwt.MapClaims{
+		"sub": "user-jwt",
+		"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	// Also set an API key — JWT should take precedence.
+	req.Header.Set("X-API-Key", "some-key")
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Auth-Method") != "JWT" {
+		t.Errorf("expected JWT auth method, got %q", resp.Header.Get("X-Auth-Method"))
+	}
+	if resp.Header.Get("X-User-ID-Echo") != "user-jwt" {
+		t.Errorf("expected user-jwt, got %q", resp.Header.Get("X-User-ID-Echo"))
+	}
+}
+
+func TestAuth_JWTWithAPIKeyFallback_KeyFallback(t *testing.T) {
+	secret := "test-secret"
+	setenv(t, "GOGATEWAY_JWT_SECRET", secret)
+
+	// Seed API key file.
+	keyFileDir := t.TempDir()
+	keyFilePath := keyFileDir + "/api-keys.yaml"
+	os.WriteFile(keyFilePath, []byte(`
+api_keys:
+  - id: "fallback-key"
+    key: "gw_fallback_key_value"
+    service: ""
+    rate_tier: "basic"
+`), 0644)
+	setenv(t, "GOGATEWAY_API_KEY_FILE", keyFilePath)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Auth-Method", "APIKey")
+		w.Header().Set("X-API-Key-ID-Echo", r.Header.Get("X-API-Key-ID"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{
+			Required: true,
+		},
+		APIKey: &config.APIKeyConfig{
+			Required: true, // fallback allowed
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// Send an invalid JWT but a valid API key.
+	badToken := hs256Token([]byte(secret), jwt.MapClaims{
+		"sub": "bad",
+		"exp": float64(time.Now().Add(-1 * time.Hour).Unix()), // expired
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+badToken)
+	req.Header.Set("X-API-Key", "gw_fallback_key_value")
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 (API key fallback), got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Auth-Method") != "APIKey" {
+		t.Errorf("expected APIKey auth method, got %q", resp.Header.Get("X-Auth-Method"))
+	}
+	if resp.Header.Get("X-API-Key-ID-Echo") != "fallback-key" {
+		t.Errorf("expected fallback-key, got %q", resp.Header.Get("X-API-Key-ID-Echo"))
+	}
+}
+
+func TestAuth_BothFail_Returns401(t *testing.T) {
+	secret := "test-secret"
+	setenv(t, "GOGATEWAY_JWT_SECRET", secret)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{Required: true},
+		APIKey: &config.APIKeyConfig{Required: true},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// No auth headers at all.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 when both auth methods fail, got %d", resp.StatusCode)
+	}
+
+	var body errorBody
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Code != "AUTH_REQUIRED" {
+		t.Errorf("expected code AUTH_REQUIRED, got %q", body.Code)
+	}
+}

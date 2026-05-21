@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/ahmadkhidir/gogateway/internal/discovery"
 	"github.com/ahmadkhidir/gogateway/internal/middleware"
 	"github.com/ahmadkhidir/gogateway/internal/router"
+	"github.com/ahmadkhidir/gogateway/internal/store"
 )
 
 // Server wraps an http.Server with the GoGateway reverse proxy and provides
@@ -30,15 +33,24 @@ type Server struct {
 	registry   discovery.Discoverer
 	balancers  map[string]balancer.Balancer // route ID → balancer
 	proxy      *httputil.ReverseProxy
+	jwtAuth    *middleware.JWTAuth
+	apiKeyAuth *middleware.APIKeyAuth
 }
 
 type contextKey string
 
 const targetURLKey contextKey = "gogateway_target_url"
 
+// defaultJWTSecret generates a random 32-byte secret for development use.
+func defaultJWTSecret() []byte {
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	return secret
+}
+
 // New creates a new Server from the given configuration. It builds the
-// route table, service registry, load balancers, and reverse proxy handler
-// chain but does not start listening.
+// route table, service registry, load balancers, JWT/API key authenticators,
+// and reverse proxy handler chain but does not start listening.
 func New(cfg *config.Config) (*Server, error) {
 	// Build the route matcher.
 	r := router.New(cfg.Routes)
@@ -69,12 +81,41 @@ func New(cfg *config.Config) (*Server, error) {
 		Transport: transport,
 	}
 
+	// --- Authentication setup ---
+
+	// JWT: use env var GOGATEWAY_JWT_SECRET, or generate a dev secret.
+	jwtSecretStr := os.Getenv("GOGATEWAY_JWT_SECRET")
+	var jwtSecret []byte
+	if jwtSecretStr != "" {
+		jwtSecret = []byte(jwtSecretStr)
+		slog.Info("JWT authentication enabled (HS256)")
+	} else {
+		jwtSecret = defaultJWTSecret()
+		slog.Warn("GOGATEWAY_JWT_SECRET not set; using random dev secret. " +
+			"Set the environment variable for a stable JWT secret.")
+	}
+	jwtAuth := middleware.NewJWTAuth(jwtSecret)
+
+	// API key store: load from api-keys.yaml (optional).
+	keyFilePath := os.Getenv("GOGATEWAY_API_KEY_FILE")
+	if keyFilePath == "" {
+		keyFilePath = "./api-keys.yaml"
+	}
+	keyStore, err := store.LoadKeyFile(keyFilePath)
+	if err != nil {
+		slog.Warn("failed to load API key file", "path", keyFilePath, "error", err)
+		keyStore = store.NewKeyStore() // fall back to empty store
+	}
+	apiKeyAuth := middleware.NewAPIKeyAuth(keyStore)
+
 	s := &Server{
-		cfg:       cfg,
-		router:    r,
-		registry:  reg,
-		balancers: balancers,
-		proxy:     proxy,
+		cfg:        cfg,
+		router:     r,
+		registry:   reg,
+		balancers:  balancers,
+		proxy:      proxy,
+		jwtAuth:    jwtAuth,
+		apiKeyAuth: apiKeyAuth,
 	}
 
 	// Build the handler chain: RequestID → routing + proxy.
@@ -90,13 +131,19 @@ func New(cfg *config.Config) (*Server, error) {
 }
 
 // serveRoute is the core request handler. It matches the request to a route,
-// picks an upstream via the load balancer, and proxies the request.
+// authenticates (if required), picks an upstream via the load balancer,
+// and proxies the request.
 func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 	// Find matching route.
 	route := s.router.Match(r)
 	if route == nil {
 		writeJSON(w, http.StatusNotFound, errorBody{Error: "no route matched", Code: "ROUTE_NOT_FOUND"})
 		return
+	}
+
+	// Authenticate the request if the route requires it.
+	if !s.authenticate(w, r, route) {
+		return // 401 or 403 already written
 	}
 
 	// Resolve upstream endpoints.
@@ -119,6 +166,71 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 
 	// Proxy the request.
 	s.proxy.ServeHTTP(w, r)
+}
+
+// authenticate checks the request against the route's auth configuration.
+// It implements the "try JWT, fallback to API key" strategy:
+//  1. If route.Auth is nil → allow (no auth required).
+//  2. If JWT is required → validate JWT; on success forward claims and allow.
+//  3. If JWT fails but API key is also required → try API key.
+//  4. If API key succeeds → forward key info and allow.
+//  5. If all methods fail → write 401 and return false.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, route *config.Route) bool {
+	if route.Auth == nil {
+		return true // no auth config, allow
+	}
+
+	jwtCfg := route.Auth.JWT
+	apiKeyCfg := route.Auth.APIKey
+
+	jwtRequired := jwtCfg != nil && jwtCfg.Required
+	apiKeyRequired := apiKeyCfg != nil && apiKeyCfg.Required
+
+	if !jwtRequired && !apiKeyRequired {
+		return true // auth section present but nothing required
+	}
+
+	// Try JWT first.
+	if jwtRequired {
+		claims, err := s.jwtAuth.Validate(r, jwtCfg)
+		if err == nil {
+			middleware.ForwardClaims(r, claims)
+			slog.Debug("JWT authentication successful",
+				"route", route.ID,
+				"user", claims["sub"])
+			return true
+		}
+		slog.Debug("JWT validation failed", "route", route.ID, "error", err)
+
+		// JWT failed; if API key is not also an option, reject now.
+		if !apiKeyRequired {
+			writeJSON(w, http.StatusUnauthorized, errorBody{
+				Error: "invalid or missing JWT token",
+				Code:  "JWT_INVALID",
+			})
+			return false
+		}
+	}
+
+	// Try API key as fallback (or primary if JWT not required).
+	if apiKeyRequired {
+		key, err := s.apiKeyAuth.Validate(r)
+		if err == nil {
+			r.Header.Set("X-API-Key-ID", key.ID)
+			r.Header.Set("X-API-Key-Tier", key.RateTier)
+			slog.Debug("API key authentication successful",
+				"route", route.ID,
+				"key_id", key.ID)
+			return true
+		}
+		slog.Debug("API key validation failed", "route", route.ID, "error", err)
+	}
+
+	writeJSON(w, http.StatusUnauthorized, errorBody{
+		Error: "authentication required",
+		Code:  "AUTH_REQUIRED",
+	})
+	return false
 }
 
 // dynamicDirector modifies the outgoing request to point at the upstream

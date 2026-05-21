@@ -1,5 +1,4 @@
 # GoGateway — Development Configuration
-# Copy this file and adjust upstream URLs for your local services.
 gateway:
   listen: ":8080"
   metrics_listen: ":9090"
@@ -13,13 +12,22 @@ redis:
   pool_size: 20
 
 routes:
-  - id: "example"
-    path: "/*"
+  # Public health endpoint — no auth required.
+  - id: "health"
+    path: "/health"
+    methods: ["GET"]
+    upstreams:
+      - url: "http://httpbin.org:80/status/200"
+
+  # Protected API — JWT required, API key as fallback.
+  - id: "api"
+    path: "/api/*"
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
     upstreams:
       - url: "http://httpbin.org:80"
     auth:
       jwt:
-        required: false
-    rate_limit:
-      enabled: false
+        required: true
+        issuers: ["https://auth.example.com"]
+      api_key:
+        required: true
