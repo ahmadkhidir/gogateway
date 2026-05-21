@@ -1,0 +1,7 @@
+gateway:
+  listen: ":8080"
+  shutdown_timeout: 15s
+  log_level: "info"
+routes:
+  - id: "broken
+    path: "/*"

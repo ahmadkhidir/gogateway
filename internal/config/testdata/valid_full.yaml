@@ -1,0 +1,46 @@
+gateway:
+  listen: ":8080"
+  metrics_listen: ":9090"
+  shutdown_timeout: 30s
+  log_level: "debug"
+
+redis:
+  addr: "redis:6379"
+  password: ""
+  db: 0
+  pool_size: 20
+
+routes:
+  - id: "users-api"
+    path: "/api/v1/users/*"
+    methods: ["GET", "POST", "PUT", "DELETE"]
+    hosts: ["api.example.com"]
+    upstreams:
+      - url: "http://users-service:8080"
+        weight: 1
+      - url: "http://users-service-secondary:8080"
+        weight: 2
+    auth:
+      jwt:
+        required: true
+        issuers: ["https://auth.example.com"]
+      api_key:
+        required: false
+    rate_limit:
+      enabled: true
+      requests: 100
+      window: 1m
+      per_client: true
+    circuit_breaker:
+      enabled: true
+      threshold: 5
+      timeout: 30s
+      half_open_max_requests: 3
+    timeout: 30s
+    retry: 2
+
+  - id: "health"
+    path: "/health"
+    methods: ["GET"]
+    upstreams:
+      - url: "http://health-service:8080"
