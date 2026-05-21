@@ -4,16 +4,21 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/ahmadkhidir/gogateway/internal/balancer"
 	"github.com/ahmadkhidir/gogateway/internal/config"
+	"github.com/ahmadkhidir/gogateway/internal/discovery"
 	"github.com/ahmadkhidir/gogateway/internal/middleware"
+	"github.com/ahmadkhidir/gogateway/internal/router"
 )
 
 // Server wraps an http.Server with the GoGateway reverse proxy and provides
@@ -21,59 +26,151 @@ import (
 type Server struct {
 	httpServer *http.Server
 	cfg        *config.Config
+	router     *router.Router
+	registry   discovery.Discoverer
+	balancers  map[string]balancer.Balancer // route ID → balancer
+	proxy      *httputil.ReverseProxy
 }
+
+type contextKey string
+
+const targetURLKey contextKey = "gogateway_target_url"
 
 // New creates a new Server from the given configuration. It builds the
-// reverse proxy handler chain but does not start listening.
+// route table, service registry, load balancers, and reverse proxy handler
+// chain but does not start listening.
 func New(cfg *config.Config) (*Server, error) {
-	// Build the reverse proxy for the first route's first upstream.
-	// Phase 1 will introduce full route matching and load balancing.
-	handler, err := buildHandler(cfg)
+	// Build the route matcher.
+	r := router.New(cfg.Routes)
+
+	// Build the static service registry.
+	reg, err := discovery.NewStaticRegistry(cfg.Routes)
 	if err != nil {
-		return nil, fmt.Errorf("server: build handler: %w", err)
+		return nil, fmt.Errorf("server: build registry: %w", err)
 	}
 
-	httpServer := &http.Server{
-		Addr:    cfg.Gateway.Listen,
-		Handler: handler,
+	// Create a load balancer for each route (default: round-robin).
+	balancers := make(map[string]balancer.Balancer, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		balancers[route.ID] = balancer.NewRoundRobin()
 	}
 
-	return &Server{
-		httpServer: httpServer,
-		cfg:        cfg,
-	}, nil
-}
-
-// buildHandler constructs the full HTTP handler chain:
-//  1. RequestID middleware
-//  2. Reverse proxy
-func buildHandler(cfg *config.Config) (http.Handler, error) {
-	// For Phase 0 we proxy to the first route's first upstream.
-	// Full routing (path/host matching, load balancing) comes in Phase 1.
-	if len(cfg.Routes) == 0 {
-		return nil, fmt.Errorf("no routes configured")
-	}
-	route := cfg.Routes[0]
-	target := route.Upstreams[0]
-
-	targetURL, err := url.Parse(target.URL)
-	if err != nil {
-		return nil, fmt.Errorf("parse upstream URL %q: %w", target.URL, err)
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-	// Customise the default transport with sensible timeouts.
-	proxy.Transport = &http.Transport{
+	// Shared transport with sensible timeouts.
+	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 	}
 
-	// Wrap with middleware chain.
-	handler := middleware.RequestID(proxy)
+	// Reverse proxy with a dynamic director that reads the target URL
+	// from the request context (set during routing).
+	proxy := &httputil.ReverseProxy{
+		Director:  dynamicDirector,
+		Transport: transport,
+	}
 
-	return handler, nil
+	s := &Server{
+		cfg:       cfg,
+		router:    r,
+		registry:  reg,
+		balancers: balancers,
+		proxy:     proxy,
+	}
+
+	// Build the handler chain: RequestID → routing + proxy.
+	handler := middleware.RequestID(http.HandlerFunc(s.serveRoute))
+
+	httpServer := &http.Server{
+		Addr:    cfg.Gateway.Listen,
+		Handler: handler,
+	}
+	s.httpServer = httpServer
+
+	return s, nil
+}
+
+// serveRoute is the core request handler. It matches the request to a route,
+// picks an upstream via the load balancer, and proxies the request.
+func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
+	// Find matching route.
+	route := s.router.Match(r)
+	if route == nil {
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "no route matched", Code: "ROUTE_NOT_FOUND"})
+		return
+	}
+
+	// Resolve upstream endpoints.
+	endpoints, err := s.registry.GetEndpoints(route.ID)
+	if err != nil || len(endpoints) == 0 {
+		slog.Warn("no upstream endpoints", "route", route.ID)
+		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "no upstream available", Code: "NO_UPSTREAM"})
+		return
+	}
+
+	// Pick an endpoint via load balancer.
+	lb := s.balancers[route.ID]
+	target := lb.Next(endpoints)
+
+	slog.Debug("routing request", "route", route.ID, "method", r.Method, "path", r.URL.Path, "target", target.String())
+
+	// Store target in request context for the director.
+	ctx := context.WithValue(r.Context(), targetURLKey, target)
+	r = r.WithContext(ctx)
+
+	// Proxy the request.
+	s.proxy.ServeHTTP(w, r)
+}
+
+// dynamicDirector modifies the outgoing request to point at the upstream
+// target stored in the request context by serveRoute.
+func dynamicDirector(r *http.Request) {
+	target, ok := r.Context().Value(targetURLKey).(*url.URL)
+	if !ok || target == nil {
+		slog.Error("dynamic director: no target URL in context")
+		return
+	}
+
+	r.URL.Scheme = target.Scheme
+	r.URL.Host = target.Host
+	r.URL.Path = singleJoiningSlash(target.Path, r.URL.Path)
+
+	// Preserve query string.
+	if target.RawQuery == "" || r.URL.RawQuery == "" {
+		r.URL.RawQuery = target.RawQuery + r.URL.RawQuery
+	} else {
+		r.URL.RawQuery = target.RawQuery + "&" + r.URL.RawQuery
+	}
+
+	// Ensure User-Agent is set.
+	if _, ok := r.Header["User-Agent"]; !ok {
+		r.Header.Set("User-Agent", "GoGateway/1.0")
+	}
+}
+
+// singleJoiningSlash joins a and b with a single slash between them.
+// Handles the common case of merging a base path like "/api" with a
+// request path like "/v1/users". This is equivalent to the unexported
+// helper in net/http/httputil.
+func singleJoiningSlash(a, b string) string {
+	a = strings.TrimRight(a, "/")
+	b = strings.TrimLeft(b, "/")
+	if a == "" {
+		return "/" + b
+	}
+	return a + "/" + b
+}
+
+// errorBody is a standard JSON error response.
+type errorBody struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+}
+
+// writeJSON writes a JSON response with the given status code.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }
 
 // Start begins listening and serving HTTP traffic. It returns an error
