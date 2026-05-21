@@ -31,3 +31,7 @@ routes:
         issuers: ["https://auth.example.com"]
       api_key:
         required: true
+    rate_limit:
+      enabled: true
+      requests: 5
+      window: 10s

@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,14 +28,15 @@ import (
 // Server wraps an http.Server with the GoGateway reverse proxy and provides
 // lifecycle control (Start, Shutdown).
 type Server struct {
-	httpServer *http.Server
-	cfg        *config.Config
-	router     *router.Router
-	registry   discovery.Discoverer
-	balancers  map[string]balancer.Balancer // route ID → balancer
-	proxy      *httputil.ReverseProxy
-	jwtAuth    *middleware.JWTAuth
-	apiKeyAuth *middleware.APIKeyAuth
+	httpServer  *http.Server
+	cfg         *config.Config
+	router      *router.Router
+	registry    discovery.Discoverer
+	balancers   map[string]balancer.Balancer // route ID → balancer
+	proxy       *httputil.ReverseProxy
+	jwtAuth     *middleware.JWTAuth
+	apiKeyAuth  *middleware.APIKeyAuth
+	rateLimiter *middleware.RateLimiter
 }
 
 type contextKey string
@@ -108,14 +110,32 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 	apiKeyAuth := middleware.NewAPIKeyAuth(keyStore)
 
+	// --- Rate limiter setup ---
+
+	// Try to connect to Redis; if unavailable the rate limiter falls back
+	// to an in-memory counter (degraded but not broken).
+	var redisClient *store.RedisClient
+	if cfg.Redis.Addr != "" {
+		rc, err := store.NewRedisClient(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB, cfg.Redis.PoolSize)
+		if err != nil {
+			slog.Warn("Redis unavailable; rate limiter using in-memory fallback", "error", err)
+		} else {
+			redisClient = rc
+			slog.Info("Rate limiter connected to Redis", "addr", cfg.Redis.Addr)
+		}
+	}
+	rateLimiter := middleware.NewRateLimiter(redisClient)
+	rateLimiter.StartCleanup(5 * time.Minute) // periodic cleanup of expired in-memory entries
+
 	s := &Server{
-		cfg:        cfg,
-		router:     r,
-		registry:   reg,
-		balancers:  balancers,
-		proxy:      proxy,
-		jwtAuth:    jwtAuth,
-		apiKeyAuth: apiKeyAuth,
+		cfg:         cfg,
+		router:      r,
+		registry:    reg,
+		balancers:   balancers,
+		proxy:       proxy,
+		jwtAuth:     jwtAuth,
+		apiKeyAuth:  apiKeyAuth,
+		rateLimiter: rateLimiter,
 	}
 
 	// Build the handler chain: RequestID → routing + proxy.
@@ -143,7 +163,12 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate the request if the route requires it.
 	if !s.authenticate(w, r, route) {
-		return // 401 or 403 already written
+		return // 401 already written
+	}
+
+	// Check rate limit.
+	if !s.checkRateLimit(w, r, route) {
+		return // 429 already written
 	}
 
 	// Resolve upstream endpoints.
@@ -231,6 +256,49 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, route *con
 		Code:  "AUTH_REQUIRED",
 	})
 	return false
+}
+
+// checkRateLimit enforces the route's rate limit configuration.
+// It sets rate limit headers on every response and returns 429 with
+// a Retry-After header when the limit is exceeded.
+func (s *Server) checkRateLimit(w http.ResponseWriter, r *http.Request, route *config.Route) bool {
+	if route.RateLimit == nil || !route.RateLimit.Enabled {
+		return true
+	}
+
+	clientID := middleware.ResolveClientID(
+		middleware.AdaptRequest(r.Header.Get, r.RemoteAddr),
+		route,
+	)
+
+	allowed, remaining, reset := s.rateLimiter.Allow(route, clientID)
+
+	// Always set rate limit headers.
+	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(route.RateLimit.Requests))
+	w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(reset).Unix(), 10))
+
+	if !allowed {
+		retryAfter := int(reset.Seconds())
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+
+		slog.Warn("rate limit exceeded",
+			"route", route.ID,
+			"client", clientID,
+			"limit", route.RateLimit.Requests,
+			"retry_after", retryAfter)
+
+		writeJSON(w, http.StatusTooManyRequests, errorBody{
+			Error: "rate limit exceeded",
+			Code:  "RATE_LIMITED",
+		})
+		return false
+	}
+
+	return true
 }
 
 // dynamicDirector modifies the outgoing request to point at the upstream

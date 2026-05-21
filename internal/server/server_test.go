@@ -37,7 +37,7 @@ func newTestConfig() *config.Config {
 			LogLevel:        "info",
 		},
 		Redis: config.RedisConfig{
-			Addr: "localhost:6379",
+			Addr: "", // empty = skip Redis (in-memory rate limiter fallback)
 			DB:   0,
 		},
 		Routes: []config.Route{
@@ -775,5 +775,264 @@ func TestAuth_BothFail_Returns401(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&body)
 	if body.Code != "AUTH_REQUIRED" {
 		t.Errorf("expected code AUTH_REQUIRED, got %q", body.Code)
+	}
+}
+
+// --- Phase 3 Rate Limiting tests ---
+
+func TestRateLimit_UnderLimit(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].RateLimit = &config.RateLimitCfg{
+		Enabled:  true,
+		Requests: 5,
+		Window:   time.Minute,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+		if resp.Header.Get("X-RateLimit-Limit") != "5" {
+			t.Errorf("request %d: expected X-RateLimit-Limit 5, got %q", i+1, resp.Header.Get("X-RateLimit-Limit"))
+		}
+	}
+}
+
+func TestRateLimit_OverLimit(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].RateLimit = &config.RateLimitCfg{
+		Enabled:  true,
+		Requests: 3,
+		Window:   time.Minute,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// Use up the limit.
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// 4th request should be 429.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 for over-limit request, got %d", resp.StatusCode)
+	}
+
+	// Check headers.
+	if resp.Header.Get("X-RateLimit-Limit") != "3" {
+		t.Errorf("expected X-RateLimit-Limit 3, got %q", resp.Header.Get("X-RateLimit-Limit"))
+	}
+	if resp.Header.Get("X-RateLimit-Remaining") != "0" {
+		t.Errorf("expected X-RateLimit-Remaining 0, got %q", resp.Header.Get("X-RateLimit-Remaining"))
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("expected Retry-After header on 429")
+	}
+	if resp.Header.Get("X-RateLimit-Reset") == "" {
+		t.Error("expected X-RateLimit-Reset header")
+	}
+
+	// Check JSON body.
+	var body errorBody
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Code != "RATE_LIMITED" {
+		t.Errorf("expected code RATE_LIMITED, got %q", body.Code)
+	}
+}
+
+func TestRateLimit_Disabled(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].RateLimit = &config.RateLimitCfg{
+		Enabled:  false, // disabled
+		Requests: 1,
+		Window:   time.Minute,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// Should be able to exceed the (disabled) limit.
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200 with rate limit disabled, got %d", i+1, resp.StatusCode)
+		}
+	}
+}
+
+func TestRateLimit_NoConfig(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].RateLimit = nil // no rate limit config
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200 with no rate limit config, got %d", i+1, resp.StatusCode)
+		}
+	}
+}
+
+func TestRateLimit_WithAuth(t *testing.T) {
+	secret := "test-secret"
+	setenv(t, "GOGATEWAY_JWT_SECRET", secret)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{Required: true},
+	}
+	cfg.Routes[0].RateLimit = &config.RateLimitCfg{
+		Enabled:  true,
+		Requests: 2,
+		Window:   time.Minute,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	token := hs256Token([]byte(secret), jwt.MapClaims{
+		"sub": "user-99",
+		"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+	})
+
+	// First two requests succeed.
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// Third request: rate limited.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected 429 after rate limit exceeded with JWT auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestRateLimit_UnauthenticatedRequestNotRateLimited(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].Auth = &config.AuthConfig{
+		JWT: &config.JWTConfig{Required: true},
+	}
+	cfg.Routes[0].RateLimit = &config.RateLimitCfg{
+		Enabled:  true,
+		Requests: 100,
+		Window:   time.Minute,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// Unauthenticated request should fail auth before rate limiting.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 (auth before rate limit), got %d", resp.StatusCode)
 	}
 }
