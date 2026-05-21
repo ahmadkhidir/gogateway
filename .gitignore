@@ -1,0 +1,43 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+gogateway
+gogateway.exe
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build output
+tmp/
+dist/
+
+# Environment / secrets
+.env
+*.env.local
+api-keys.yaml
+
+# Test artifacts
+profile.out
+cpu.prof
+mem.prof
+
+# OS files
+Thumbs.db
+Desktop.ini
