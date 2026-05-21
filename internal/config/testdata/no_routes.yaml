@@ -1,0 +1,11 @@
+gateway:
+  listen: ":8080"
+  shutdown_timeout: 15s
+  log_level: "info"
+
+redis:
+  addr: "localhost:6379"
+  db: 0
+  pool_size: 20
+
+routes: []

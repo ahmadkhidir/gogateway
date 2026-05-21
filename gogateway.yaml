@@ -1,0 +1,25 @@
+# GoGateway — Development Configuration
+# Copy this file and adjust upstream URLs for your local services.
+gateway:
+  listen: ":8080"
+  metrics_listen: ":9090"
+  shutdown_timeout: 15s
+  log_level: "info"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 20
+
+routes:
+  - id: "example"
+    path: "/*"
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
+    upstreams:
+      - url: "http://httpbin.org:80"
+    auth:
+      jwt:
+        required: false
+    rate_limit:
+      enabled: false

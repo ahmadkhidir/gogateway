@@ -1,0 +1,8 @@
+{"time":"2026-05-21T17:24:17.0050889+01:00","level":"INFO","msg":"config loaded","path":"./gogateway.yaml"}
+{"time":"2026-05-21T17:24:17.0076756+01:00","level":"INFO","msg":"listening","addr":":8080"}
+{"time":"2026-05-21T17:24:17.0092874+01:00","level":"INFO","msg":"starting gateway","listen":":8080"}
+{"time":"2026-05-21T17:24:17.0146329+01:00","level":"ERROR","msg":"server error","error":"listen tcp :8080: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted."}
+{"time":"2026-05-21T17:24:17.0164061+01:00","level":"INFO","msg":"shutting down"}
+{"time":"2026-05-21T17:24:17.0175853+01:00","level":"INFO","msg":"shutting down gateway gracefully"}
+{"time":"2026-05-21T17:24:17.0190778+01:00","level":"INFO","msg":"gateway stopped"}
+{"time":"2026-05-21T17:24:17.1201614+01:00","level":"INFO","msg":"gateway stopped"}
