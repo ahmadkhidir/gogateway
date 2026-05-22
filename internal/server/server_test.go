@@ -12,6 +12,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/ahmadkhidir/gogateway/internal/config"
+	"github.com/ahmadkhidir/gogateway/internal/metrics"
 )
 
 // setenv sets an environment variable for the duration of the test.
@@ -282,8 +283,8 @@ func TestServer_MultiRouteRouting(t *testing.T) {
 			},
 		},
 		{
-			ID:      "health",
-			Path:    "/health",
+			ID:      "status",
+			Path:    "/statusz",
 			Methods: []string{"GET"},
 			Upstreams: []config.Upstream{
 				{URL: upstreamB.URL},
@@ -306,12 +307,12 @@ func TestServer_MultiRouteRouting(t *testing.T) {
 	}
 
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req2 := httptest.NewRequest(http.MethodGet, "/statusz", nil)
 	srv.ServeHTTP(rec2, req2)
 	resp2 := rec2.Result()
 	resp2.Body.Close()
 	if resp2.Header.Get("X-Upstream") != "B" {
-		t.Errorf("/health: expected upstream B, got %q", resp2.Header.Get("X-Upstream"))
+		t.Errorf("/statusz: expected upstream B, got %q", resp2.Header.Get("X-Upstream"))
 	}
 }
 
@@ -1247,5 +1248,104 @@ func TestCircuitBreaker_SuccessResetsCounter(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("expected 503 (circuit now open), got %d", resp2.StatusCode)
+	}
+}
+
+// --- Phase 5 Observability tests ---
+
+func TestHealthEndpoint_Returns200(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	cfg := newTestConfig()
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	srv.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for health endpoint, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("expected JSON content type, got %q", ct)
+	}
+
+	var health metrics.HealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatalf("error decoding health response: %v", err)
+	}
+	if health.Status != "ok" {
+		t.Errorf("expected status ok, got %q", health.Status)
+	}
+	if health.Timestamp == "" {
+		t.Error("expected non-empty timestamp")
+	}
+}
+
+func TestHealthEndpoint_OnlyAcceptsGET(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	cfg := newTestConfig()
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(method, "/health", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s /health: expected 405, got %d", method, resp.StatusCode)
+		}
+	}
+}
+
+func TestConfiguredRouteStillRoutable(t *testing.T) {
+	// Verify that non-/health paths are still matched by the router.
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream", "reached")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes = []config.Route{
+		{
+			ID:      "api",
+			Path:    "/api/*",
+			Methods: []string{"GET"},
+			Upstreams: []config.Upstream{
+				{URL: upstream.URL},
+			},
+		},
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for proxied route, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Upstream") != "reached" {
+		t.Errorf("expected upstream to be reached, got header %q", resp.Header.Get("X-Upstream"))
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/ahmadkhidir/gogateway/internal/balancer"
 	"github.com/ahmadkhidir/gogateway/internal/config"
 	"github.com/ahmadkhidir/gogateway/internal/discovery"
+	"github.com/ahmadkhidir/gogateway/internal/metrics"
 	"github.com/ahmadkhidir/gogateway/internal/middleware"
 	"github.com/ahmadkhidir/gogateway/internal/router"
 	"github.com/ahmadkhidir/gogateway/internal/store"
@@ -28,16 +29,19 @@ import (
 // Server wraps an http.Server with the GoGateway reverse proxy and provides
 // lifecycle control (Start, Shutdown).
 type Server struct {
-	httpServer   *http.Server
-	cfg          *config.Config
-	router       *router.Router
-	registry     discovery.Discoverer
-	balancers    map[string]balancer.Balancer // route ID → balancer
-	proxy        *httputil.ReverseProxy
-	jwtAuth      *middleware.JWTAuth
-	apiKeyAuth   *middleware.APIKeyAuth
-	rateLimiter  *middleware.RateLimiter
-	breakerStore *middleware.BreakerStore
+	httpServer    *http.Server
+	cfg           *config.Config
+	router        *router.Router
+	registry      discovery.Discoverer
+	balancers     map[string]balancer.Balancer // route ID → balancer
+	proxy         *httputil.ReverseProxy
+	jwtAuth       *middleware.JWTAuth
+	apiKeyAuth    *middleware.APIKeyAuth
+	rateLimiter   *middleware.RateLimiter
+	breakerStore  *middleware.BreakerStore
+	metrics       *metrics.Metrics
+	metricsServer *http.Server
+	breakerDone   chan struct{}
 }
 
 type contextKey string
@@ -131,6 +135,10 @@ func New(cfg *config.Config) (*Server, error) {
 	// --- Circuit breaker setup ---
 	breakerStore := middleware.NewBreakerStore()
 
+	// --- Metrics setup ---
+	promMetrics := metrics.NewMetrics()
+	breakerDone := make(chan struct{})
+
 	s := &Server{
 		cfg:          cfg,
 		router:       r,
@@ -141,14 +149,29 @@ func New(cfg *config.Config) (*Server, error) {
 		apiKeyAuth:   apiKeyAuth,
 		rateLimiter:  rateLimiter,
 		breakerStore: breakerStore,
+		metrics:      promMetrics,
+		breakerDone:  breakerDone,
 	}
 
-	// Build the handler chain: RequestID → routing + proxy.
-	handler := middleware.RequestID(http.HandlerFunc(s.serveRoute))
+	// Start the breaker state update loop.
+	adapter := &breakerStateAdapter{store: breakerStore}
+	go promMetrics.RunBreakerStateLoop(30*time.Second, adapter, breakerDone)
+
+	// Start the metrics server (separate port for Prometheus scraping).
+	metricsServer, err := metrics.StartMetricsServer(cfg.Gateway.MetricsListen, promMetrics)
+	if err != nil {
+		return nil, fmt.Errorf("server: start metrics server: %w", err)
+	}
+	s.metricsServer = metricsServer
+
+	// Build the handler chain: health → RequestID → routing + proxy.
+	mainMux := http.NewServeMux()
+	mainMux.Handle("/health", metrics.HealthHandler())
+	mainMux.Handle("/", middleware.RequestID(http.HandlerFunc(s.serveRoute)))
 
 	httpServer := &http.Server{
 		Addr:    cfg.Gateway.Listen,
-		Handler: handler,
+		Handler: mainMux,
 	}
 	s.httpServer = httpServer
 
@@ -156,23 +179,38 @@ func New(cfg *config.Config) (*Server, error) {
 }
 
 // serveRoute is the core request handler. It matches the request to a route,
-// authenticates (if required), picks an upstream via the load balancer,
-// and proxies the request.
+// authenticates (if required), enforces rate limits, checks circuit breakers,
+// proxies the request, and records observability metrics.
 func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
-	// Find matching route.
-	route := s.router.Match(r)
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w}
+	s.metrics.ActiveConnections.Inc()
+
+	// Find matching route (declared here for the defer closure below).
+	var route *config.Route
+	defer func() {
+		s.metrics.ActiveConnections.Dec()
+		s.metrics.RecordRequest(
+			routeLabel(route),
+			r.Method,
+			strconv.Itoa(rec.Status()),
+			time.Since(start),
+		)
+	}()
+
+	route = s.router.Match(r)
 	if route == nil {
-		writeJSON(w, http.StatusNotFound, errorBody{Error: "no route matched", Code: "ROUTE_NOT_FOUND"})
+		writeJSON(rec, http.StatusNotFound, errorBody{Error: "no route matched", Code: "ROUTE_NOT_FOUND"})
 		return
 	}
 
 	// Authenticate the request if the route requires it.
-	if !s.authenticate(w, r, route) {
+	if !s.authenticate(rec, r, route) {
 		return // 401 already written
 	}
 
 	// Check rate limit.
-	if !s.checkRateLimit(w, r, route) {
+	if !s.checkRateLimit(rec, r, route) {
 		return // 429 already written
 	}
 
@@ -180,7 +218,7 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 	endpoints, err := s.registry.GetEndpoints(route.ID)
 	if err != nil || len(endpoints) == 0 {
 		slog.Warn("no upstream endpoints", "route", route.ID)
-		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "no upstream available", Code: "NO_UPSTREAM"})
+		writeJSON(rec, http.StatusServiceUnavailable, errorBody{Error: "no upstream available", Code: "NO_UPSTREAM"})
 		return
 	}
 
@@ -195,7 +233,7 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 		if !breaker.Allow() {
 			slog.Warn("circuit breaker open, rejecting request",
 				"route", route.ID, "target", target.String())
-			writeJSON(w, http.StatusServiceUnavailable, errorBody{
+			writeJSON(rec, http.StatusServiceUnavailable, errorBody{
 				Error: "upstream circuit breaker open",
 				Code:  "CIRCUIT_OPEN",
 			})
@@ -209,10 +247,7 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), targetURLKey, target)
 	r = r.WithContext(ctx)
 
-	// Wrap the ResponseWriter to capture the upstream response status.
-	rec := &statusRecorder{ResponseWriter: w}
-
-	// Proxy the request.
+	// Proxy the request. (rec already captures the status code.)
 	s.proxy.ServeHTTP(rec, r)
 
 	// Record result in circuit breaker (if enabled).
@@ -229,6 +264,14 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 				"route", route.ID, "target", target.String(), "status", status)
 		}
 	}
+}
+
+// routeLabel returns the route ID for metrics labels, or "unknown" if nil.
+func routeLabel(route *config.Route) string {
+	if route == nil {
+		return "unknown"
+	}
+	return route.ID
 }
 
 // authenticate checks the request against the route's auth configuration.
@@ -329,6 +372,7 @@ func (s *Server) checkRateLimit(w http.ResponseWriter, r *http.Request, route *c
 			"limit", route.RateLimit.Requests,
 			"retry_after", retryAfter)
 
+		s.metrics.RecordRateLimitRejection(route.ID)
 		writeJSON(w, http.StatusTooManyRequests, errorBody{
 			Error: "rate limit exceeded",
 			Code:  "RATE_LIMITED",
@@ -337,6 +381,21 @@ func (s *Server) checkRateLimit(w http.ResponseWriter, r *http.Request, route *c
 	}
 
 	return true
+}
+
+// breakerStateAdapter adapts *middleware.BreakerStore to the
+// metrics.BreakerStateProvider interface for periodic Prometheus export.
+type breakerStateAdapter struct {
+	store *middleware.BreakerStore
+}
+
+func (a *breakerStateAdapter) BreakerStates() map[string]int {
+	snap := a.store.Snapshot()
+	result := make(map[string]int, len(snap))
+	for k, v := range snap {
+		result[k] = int(v)
+	}
+	return result
 }
 
 // statusRecorder wraps an http.ResponseWriter to capture the HTTP status
@@ -430,6 +489,16 @@ func (s *Server) Start() error {
 // shutdown timeout for in-flight requests to complete.
 func (s *Server) Shutdown() error {
 	slog.Info("shutting down gateway gracefully")
+
+	// Stop the breaker state update loop.
+	close(s.breakerDone)
+
+	// Shutdown the metrics server.
+	if err := metrics.ShutdownMetricsServer(s.metricsServer, s.cfg.Gateway.ShutdownTimeout); err != nil {
+		slog.Warn("metrics server shutdown error", "error", err)
+	}
+
+	// Shutdown the main HTTP server.
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Gateway.ShutdownTimeout)
 	defer cancel()
 
