@@ -268,16 +268,43 @@ func (m *Metrics) renderHistograms(buf *strings.Builder) {
 	for _, key := range keys {
 		h := m.RequestDuration.values[key]
 		vals := strings.Split(key, "\x00")
-		ls := formatLabels(m.RequestDuration.names, vals)
 		base := "gogateway_request_duration_seconds"
 		for _, b := range m.RequestDuration.buckets {
-			fmt.Fprintf(buf, "%s_bucket{le=\"%g\"%s} %d\n", base, b, ls, h.buckets[b])
+			ls := mergeLabels(m.RequestDuration.names, vals, "le", fmt.Sprintf("%g", b))
+			fmt.Fprintf(buf, "%s_bucket%s %d\n", base, ls, h.buckets[b])
 		}
-		fmt.Fprintf(buf, "%s_bucket{le=\"+Inf\"%s} %d\n", base, ls, h.count)
+		lsInf := mergeLabels(m.RequestDuration.names, vals, "le", "+Inf")
+		fmt.Fprintf(buf, "%s_bucket%s %d\n", base, lsInf, h.count)
+		ls := formatLabels(m.RequestDuration.names, vals)
 		fmt.Fprintf(buf, "%s_sum%s %g\n", base, ls, h.sum)
 		fmt.Fprintf(buf, "%s_count%s %d\n", base, ls, h.count)
 	}
 	m.RequestDuration.mu.Unlock()
+}
+
+// mergeLabels builds a Prometheus label string combining existing labels
+// with one extra key=value pair. The extra pair is appended last.
+func mergeLabels(names, vals []string, extraKey, extraVal string) string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, n := range names {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(n)
+		b.WriteString(`="`)
+		b.WriteString(vals[i])
+		b.WriteByte('"')
+	}
+	if len(names) > 0 {
+		b.WriteByte(',')
+	}
+	b.WriteString(extraKey)
+	b.WriteString(`="`)
+	b.WriteString(extraVal)
+	b.WriteByte('"')
+	b.WriteByte('}')
+	return b.String()
 }
 
 func sortedKeys(m map[string]float64) []string {

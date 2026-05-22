@@ -139,6 +139,51 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestHistogramFormat(t *testing.T) {
+	m := NewMetrics()
+	m.RecordRequest("api", "GET", "200", 500*time.Millisecond)
+	m.RecordRequest("api", "GET", "200", 100*time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, req)
+	resp := rec.Result()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	output := string(body)
+
+	// Verify the bucket line has the correct Prometheus format:
+	//   gogateway_request_duration_seconds_bucket{le="0.005",route="api",method="GET"} 0
+	lines := strings.Split(output, "\n")
+	foundBucket := false
+	for _, line := range lines {
+		if strings.Contains(line, "_bucket{") {
+			foundBucket = true
+			// Must contain le= inside the same brace group as route and method.
+			if !strings.Contains(line, `le=`) {
+				t.Errorf("bucket line missing le label: %q", line)
+			}
+			if strings.Count(line, "{") != 1 {
+				t.Errorf("bucket line should have exactly one brace group: %q", line)
+			}
+			if strings.Count(line, "}") != 1 {
+				t.Errorf("bucket line should have exactly one closing brace: %q", line)
+			}
+		}
+	}
+	if !foundBucket {
+		t.Error("no bucket lines found in metrics output")
+	}
+
+	// Also verify _sum and _count lines.
+	if !strings.Contains(output, "_sum") {
+		t.Error("expected _sum line in histogram output")
+	}
+	if !strings.Contains(output, "_count") {
+		t.Error("expected _count line in histogram output")
+	}
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	handler := HealthHandler()
 
