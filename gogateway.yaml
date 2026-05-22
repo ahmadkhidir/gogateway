@@ -1,4 +1,7 @@
 # GoGateway — Development Configuration
+#
+# Works with docker-compose.yml (Redis host: "redis")
+# or standalone (update redis.addr to "localhost:6379").
 gateway:
   listen: ":8080"
   metrics_listen: ":9090"
@@ -6,36 +9,26 @@ gateway:
   log_level: "info"
 
 redis:
-  addr: "localhost:6379"
+  addr: "redis:6379"
   password: ""
   db: 0
   pool_size: 20
 
 routes:
-  # Public health endpoint — no auth required.
-  - id: "health"
-    path: "/health"
-    methods: ["GET"]
-    upstreams:
-      - url: "http://httpbin.org:80/status/200"
-
-  # Protected API — JWT required, API key as fallback.
-  - id: "api"
-    path: "/api/*"
+  # Built-in health endpoint is always available at /health.
+  # This route proxies health checks to an upstream for illustration.
+  - id: "example"
+    path: "/*"
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
     upstreams:
-      - url: "http://httpbin.orgn:80"
+      - url: "http://httpbin.org:80"
+      - url: "http://google.com:80"
     auth:
       jwt:
-        required: true
-        issuers: ["https://auth.example.com"]
+        required: false
       api_key:
-        required: true
+        required: false
     rate_limit:
-      enabled: true
-      requests: 5
-      window: 10s
+      enabled: false
     circuit_breaker:
-      enabled: true
-      threshold: 3
-      timeout: 5s
+      enabled: false

@@ -1,0 +1,26 @@
+# GoGateway — Kubernetes Service
+#
+# Apply: kubectl apply -f deploy/k8s-service.yaml
+#
+# Exposes the gateway HTTP port internally via ClusterIP.
+# For external access, use port-forward or an Ingress controller.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: gogateway
+  labels:
+    app: gogateway
+spec:
+  type: ClusterIP
+  selector:
+    app: gogateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

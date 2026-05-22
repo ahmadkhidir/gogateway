@@ -1,0 +1,53 @@
+# GoGateway — Redis (Kubernetes)
+#
+# Apply: kubectl apply -f deploy/k8s-redis.yaml
+#
+# A minimal single-replica Redis instance for rate limiting and API key
+# storage. For production use a Redis Operator or external service.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gogateway-redis
+  labels:
+    app: gogateway-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gogateway-redis
+  template:
+    metadata:
+      labels:
+        app: gogateway-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "16Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gogateway-redis
+  labels:
+    app: gogateway-redis
+spec:
+  type: ClusterIP
+  selector:
+    app: gogateway-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP

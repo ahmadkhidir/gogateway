@@ -1,0 +1,17 @@
+# Prometheus configuration for GoGateway scraping.
+# Referenced by docker-compose.yml and K8s manifests.
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'gogateway'
+    static_configs:
+      - targets: ['gogateway:9090']
+        labels:
+          service: 'gogateway'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
