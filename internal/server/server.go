@@ -28,15 +28,16 @@ import (
 // Server wraps an http.Server with the GoGateway reverse proxy and provides
 // lifecycle control (Start, Shutdown).
 type Server struct {
-	httpServer  *http.Server
-	cfg         *config.Config
-	router      *router.Router
-	registry    discovery.Discoverer
-	balancers   map[string]balancer.Balancer // route ID → balancer
-	proxy       *httputil.ReverseProxy
-	jwtAuth     *middleware.JWTAuth
-	apiKeyAuth  *middleware.APIKeyAuth
-	rateLimiter *middleware.RateLimiter
+	httpServer   *http.Server
+	cfg          *config.Config
+	router       *router.Router
+	registry     discovery.Discoverer
+	balancers    map[string]balancer.Balancer // route ID → balancer
+	proxy        *httputil.ReverseProxy
+	jwtAuth      *middleware.JWTAuth
+	apiKeyAuth   *middleware.APIKeyAuth
+	rateLimiter  *middleware.RateLimiter
+	breakerStore *middleware.BreakerStore
 }
 
 type contextKey string
@@ -127,15 +128,19 @@ func New(cfg *config.Config) (*Server, error) {
 	rateLimiter := middleware.NewRateLimiter(redisClient)
 	rateLimiter.StartCleanup(5 * time.Minute) // periodic cleanup of expired in-memory entries
 
+	// --- Circuit breaker setup ---
+	breakerStore := middleware.NewBreakerStore()
+
 	s := &Server{
-		cfg:         cfg,
-		router:      r,
-		registry:    reg,
-		balancers:   balancers,
-		proxy:       proxy,
-		jwtAuth:     jwtAuth,
-		apiKeyAuth:  apiKeyAuth,
-		rateLimiter: rateLimiter,
+		cfg:          cfg,
+		router:       r,
+		registry:     reg,
+		balancers:    balancers,
+		proxy:        proxy,
+		jwtAuth:      jwtAuth,
+		apiKeyAuth:   apiKeyAuth,
+		rateLimiter:  rateLimiter,
+		breakerStore: breakerStore,
 	}
 
 	// Build the handler chain: RequestID → routing + proxy.
@@ -183,14 +188,47 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request) {
 	lb := s.balancers[route.ID]
 	target := lb.Next(endpoints)
 
+	// Check circuit breaker for this upstream pool.
+	cbEnabled := route.CircuitBreaker != nil && route.CircuitBreaker.Enabled
+	if cbEnabled {
+		breaker := s.breakerStore.GetOrCreate(route.ID, target.String(), *route.CircuitBreaker)
+		if !breaker.Allow() {
+			slog.Warn("circuit breaker open, rejecting request",
+				"route", route.ID, "target", target.String())
+			writeJSON(w, http.StatusServiceUnavailable, errorBody{
+				Error: "upstream circuit breaker open",
+				Code:  "CIRCUIT_OPEN",
+			})
+			return
+		}
+	}
+
 	slog.Debug("routing request", "route", route.ID, "method", r.Method, "path", r.URL.Path, "target", target.String())
 
 	// Store target in request context for the director.
 	ctx := context.WithValue(r.Context(), targetURLKey, target)
 	r = r.WithContext(ctx)
 
+	// Wrap the ResponseWriter to capture the upstream response status.
+	rec := &statusRecorder{ResponseWriter: w}
+
 	// Proxy the request.
-	s.proxy.ServeHTTP(w, r)
+	s.proxy.ServeHTTP(rec, r)
+
+	// Record result in circuit breaker (if enabled).
+	if cbEnabled {
+		breaker := s.breakerStore.GetOrCreate(route.ID, target.String(), *route.CircuitBreaker)
+		status := rec.Status()
+		if status >= 500 {
+			breaker.RecordFailure()
+			slog.Debug("circuit breaker recording failure",
+				"route", route.ID, "target", target.String(), "status", status)
+		} else if status > 0 {
+			breaker.RecordSuccess()
+			slog.Debug("circuit breaker recording success",
+				"route", route.ID, "target", target.String(), "status", status)
+		}
+	}
 }
 
 // authenticate checks the request against the route's auth configuration.
@@ -299,6 +337,34 @@ func (s *Server) checkRateLimit(w http.ResponseWriter, r *http.Request, route *c
 	}
 
 	return true
+}
+
+// statusRecorder wraps an http.ResponseWriter to capture the HTTP status
+// code written by the upstream proxy response.
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode  int
+	wroteHeader bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.wroteHeader {
+		r.statusCode = code
+		r.wroteHeader = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(data []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.ResponseWriter.Write(data)
+}
+
+// Status returns the captured status code, or 0 if no header was written.
+func (r *statusRecorder) Status() int {
+	return r.statusCode
 }
 
 // dynamicDirector modifies the outgoing request to point at the upstream

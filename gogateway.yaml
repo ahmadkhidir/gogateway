@@ -24,7 +24,7 @@ routes:
     path: "/api/*"
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
     upstreams:
-      - url: "http://httpbin.org:80"
+      - url: "http://httpbin.orgn:80"
     auth:
       jwt:
         required: true
@@ -35,3 +35,7 @@ routes:
       enabled: true
       requests: 5
       window: 10s
+    circuit_breaker:
+      enabled: true
+      threshold: 3
+      timeout: 5s

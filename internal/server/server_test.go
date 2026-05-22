@@ -1036,3 +1036,216 @@ func TestRateLimit_UnauthenticatedRequestNotRateLimited(t *testing.T) {
 		t.Errorf("expected 401 (auth before rate limit), got %d", resp.StatusCode)
 	}
 }
+
+// --- Phase 4 Circuit Breaker tests ---
+
+func TestCircuitBreaker_DisabledByDefault(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	// No CircuitBreaker config — should be skipped.
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+	}
+}
+
+func TestCircuitBreaker_TripsOnConsecutive5xx(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	// Upstream that returns 500 on every request.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].CircuitBreaker = &config.CircuitBrkCfg{
+		Enabled:   true,
+		Threshold: 3,
+		Timeout:   30 * time.Second,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// First 3 requests: upstream returns 500, gateway proxies them (200 proxy response = 500 from upstream).
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		// The gateway forwards the upstream 500 to the client.
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("request %d: expected 500 from upstream, got %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// 4th request: circuit should be open → 503.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 after circuit trips, got %d", resp.StatusCode)
+	}
+
+	var body errorBody
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.Code != "CIRCUIT_OPEN" {
+		t.Errorf("expected code CIRCUIT_OPEN, got %q", body.Code)
+	}
+}
+
+func TestCircuitBreaker_RecoversAfterTimeout(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	// Upstream that starts failing, then recovers.
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount <= 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].CircuitBreaker = &config.CircuitBrkCfg{
+		Enabled:   true,
+		Threshold: 3,
+		Timeout:   30 * time.Millisecond,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// Trip the breaker.
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		rec.Result().Body.Close()
+	}
+
+	// Circuit open → 503.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 immediately after trip, got %d", resp.StatusCode)
+	}
+
+	// Wait for timeout → half-open.
+	time.Sleep(40 * time.Millisecond)
+
+	// Now the probe request should go through (upstream now returns 200).
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec2, req2)
+	resp2 := rec2.Result()
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after circuit recovers (probe), got %d", resp2.StatusCode)
+	}
+}
+
+func TestCircuitBreaker_SuccessResetsCounter(t *testing.T) {
+	setenv(t, "GOGATEWAY_JWT_SECRET", "test-secret")
+
+	// Upstream returns: 500, 500, 200 (resets), 500, 500.
+	// After the 200 the failure count is 0, so two more 500s (count=1, count=2)
+	// are not enough to trip the breaker (threshold=3).
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 3 {
+			w.WriteHeader(http.StatusOK) // success resets counter
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := newTestConfig()
+	cfg.Routes[0].Upstreams[0].URL = upstream.URL
+	cfg.Routes[0].CircuitBreaker = &config.CircuitBrkCfg{
+		Enabled:   true,
+		Threshold: 3,
+		Timeout:   30 * time.Second,
+	}
+
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// First 5 requests: 500, 500, 200 (resets), 500, 500.
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		srv.ServeHTTP(rec, req)
+		resp := rec.Result()
+		resp.Body.Close()
+		// All should go through (no 503 from circuit breaker).
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			t.Errorf("request %d: unexpected 503 (circuit should be closed)", i+1)
+		}
+	}
+
+	// Circuit is still closed (count=2 after 5th request, below threshold 3).
+	// 6th request: upstream returns 500, count becomes 3, trips AFTER response.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+
+	// Response is the upstream 500 (circuit trips after writing the response).
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 from upstream (circuit tripped after response), got %d", resp.StatusCode)
+	}
+
+	// 7th request: circuit is now open → 503.
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	srv.ServeHTTP(rec2, req2)
+	resp2 := rec2.Result()
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 (circuit now open), got %d", resp2.StatusCode)
+	}
+}
