@@ -54,100 +54,58 @@ go build -o gogateway ./cmd/gogateway
 ## Architecture Overview
 
 ```mermaid
-graph TB
-  subgraph Clients["Clients"]
-    Client([HTTP Client])
-  end
+flowchart TB
+  Client(["HTTP Client"])
 
-  subgraph GoGateway["GoGateway"]
-    direction TB
-
-    subgraph Entry["Entry Layer"]
-      Health[/"/health endpoint/]
-      MetricsEP[/"/metrics endpoint/]
-      ReqID[Request ID Middleware\nX-Request-Id injection]
-    end
-
-    subgraph Router["Routing"]
-      RouterMod[Route Matcher\nmethod / host / path\nwildcard: /*]
-    end
-
-    subgraph Auth["Authentication"]
-      JWT[JWT Validator\nHS256 & RS256\nissuer whitelist]
-      APIKey[API Key Auth\nSHA-256 hashed store\nkey revocation]
-    end
-
-    subgraph Traffic["Traffic Management"]
-      RateLim[Rate Limiter\nRedis-backed\nin-memory fallback\nX-RateLimit-* headers]
-      CB[Circuit Breaker\nClosed / Open / Half-Open\nper-upstream pool]
-    end
-
-    subgraph LB["Load Balancing"]
-      Balancer{Balancer}
-      RR[Round Robin]
-      LC[Least Connections]
-    end
-
-    subgraph Observability["Observability"]
-      PromMetrics[Prometheus Metrics\ncounter / histogram / gauge\nstdlib exposition format]
-      Logger[Structured Logger\nJSON via log/slog]
-      Tracing[Distributed Tracing\nX-Request-Id]
-    end
-
-    Proxy[[Reverse Proxy\nhttputil.ReverseProxy]]
+  subgraph Gateway["GoGateway"]
+    direction LR
+    ReqID["Request ID\nX-Request-Id injection"]
+    RouterMod{"Route Matcher\nmethod / host / path"}
+    JWT["JWT Validator\nHS256 & RS256"]
+    APIKey["API Key Auth\nSHA-256 hash store"]
+    RateLim["Rate Limiter\nRedis + memory fallback"]
+    CB["Circuit Breaker\nClosed / Open / Half-Open"]
+    RR["Round Robin"]
+    LC["Least Connections"]
+    Proxy[["Reverse Proxy\nhttputil.ReverseProxy"]]
   end
 
   subgraph Infra["Infrastructure"]
-    Redis[(Redis\nrate limit store)]
-    PromServer[Prometheus\nmetrics scraper]
+    Redis[("Redis\nrate limit store")]
+    PromServer["Prometheus\nmetrics scraper"]
+    HealthEP["/health endpoint"]
+    MetricsEP["/metrics endpoint"]
   end
 
   subgraph Upstreams["Upstream Services"]
-    Svc1[Service A]
-    Svc2[Service B]
-    SvcN[Service ...]
+    Svc1["Service A"]
+    Svc2["Service B"]
+    SvcN["Service ..."]
   end
 
   Client --> ReqID
   ReqID --> RouterMod
-  RouterMod -->|no match| Error1[404 Route Not Found]
+  RouterMod -->|no match| Err404["404 Route Not Found"]
   RouterMod -->|match| JWT
-  JWT -->|fail, alt avail| APIKey
   JWT -->|pass| RateLim
+  JWT -->|fail| APIKey
   APIKey -->|pass| RateLim
-  APIKey -->|fail| Error2[401 Unauthorized]
-  RateLim -->|exceeded| Error3[429 Rate Limited]
-  RateLim -->|allowed| Balancer
-  Balancer --> RR
-  Balancer --> LC
+  APIKey -->|fail| Err401["401 Unauthorized"]
+  RateLim -->|exceeded| Err429["429 Rate Limited"]
+  RateLim -->|allowed| RR
+  RateLim -->|allowed| LC
   RR --> CB
   LC --> CB
-  CB -->|open| Error4[503 Circuit Open]
+  CB -->|open| Err503["503 Circuit Open"]
   CB -->|closed| Proxy
   Proxy --> Svc1
   Proxy --> Svc2
   Proxy --> SvcN
-  Proxy -.->|metrics & logs| Observability
 
   Redis -.-> RateLim
-  PromServer -.->|scrapes /metrics| MetricsEP
-
-  Health -->|returns JSON status| Client
+  PromServer -.->|scrapes| MetricsEP
+  HealthEP -->|"JSON {status:ok}"| Client
   MetricsEP --> PromServer
-
-  style Client fill:#e1f5fe,stroke:#01579b
-  style Error1 fill:#ffebee,stroke:#c62828
-  style Error2 fill:#ffebee,stroke:#c62828
-  style Error3 fill:#ffebee,stroke:#c62828
-  style Error4 fill:#ffebee,stroke:#c62828
-  style RouterMod fill:#fff3e0,stroke:#e65100
-  style JWT fill:#e8f5e9,stroke:#2e7d32
-  style APIKey fill:#e8f5e9,stroke:#2e7d32
-  style RateLim fill:#f3e5f5,stroke:#6a1b9a
-  style CB fill:#f3e5f5,stroke:#6a1b9a
-  style Proxy fill:#e3f2fd,stroke:#1565c0
-  style Redis fill:#fffde7,stroke:#f9a825
-  style PromServer fill:#fffde7,stroke:#f9a825
 ```
 
 ### Request Flow
@@ -180,13 +138,18 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Closed
-  Closed --> Open: consecutive failures >= threshold
-  Open --> HalfOpen: timeout elapsed
-  HalfOpen --> Closed: probe succeeds
-  HalfOpen --> Open: probe fails
-  Open --> Open: requests rejected
-  Closed --> Closed: success resets counter
+  direction LR
+  s1 : Closed
+  s2 : Open
+  s3 : Half-Open
+
+  [*] --> s1
+  s1 --> s2 : consecutive failures >= threshold
+  s2 --> s3 : timeout elapsed
+  s3 --> s1 : probe succeeds
+  s3 --> s2 : probe fails
+  s2 --> s2 : requests rejected
+  s1 --> s1 : success resets counter
 ```
 
 ---
